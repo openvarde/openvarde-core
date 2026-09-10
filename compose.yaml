@@ -1,0 +1,25 @@
+services:
+  core:
+    build: .
+    container_name: openvarde-core
+    restart: unless-stopped
+
+    ports:
+      - "8081:8081"
+
+    environment:
+      MQTT_URL: mqtt://openvarde-mqtt:1883
+
+    volumes:
+      - openvarde-data:/var/lib/openvarde
+
+    networks:
+      - openvarde
+
+volumes:
+  openvarde-data:
+    name: openvarde-data
+
+networks:
+  openvarde:
+    external: true
