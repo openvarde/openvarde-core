@@ -4,15 +4,66 @@ services:
     container_name: openvarde-core
     restart: unless-stopped
 
-    network_mode: host
-
     environment:
-      MQTT_URL: mqtt://127.0.0.1:1883
+      MQTT_URL: mqtt://openvarde-mqtt:1883
       PORT: 8081
 
     volumes:
       - openvarde-data:/var/lib/openvarde
 
+    networks:
+      - openvarde
+
+    labels:
+      - traefik.enable=true
+
+      - traefik.http.routers.openvarde-health.rule=Path(`/health`)
+      - traefik.http.routers.openvarde-health.entrypoints=web
+      - traefik.http.routers.openvarde-health.service=openvarde-core
+
+      - traefik.http.routers.openvarde-wellknown.rule=Path(`/.well-known/openvarde`)
+      - traefik.http.routers.openvarde-wellknown.entrypoints=web
+      - traefik.http.routers.openvarde-wellknown.service=openvarde-core
+
+      - traefik.http.services.openvarde-core.loadbalancer.server.port=8081
+
+  discovery:
+    build: .
+    container_name: openvarde-discovery
+    restart: unless-stopped
+
+    command:
+      - node
+      - src/discovery.js
+
+    network_mode: host
+
+    volumes:
+      - openvarde-data:/var/lib/openvarde:ro
+
+  traefik:
+    image: traefik:v3
+    container_name: openvarde-gateway
+    restart: unless-stopped
+
+    command:
+      - --providers.docker=true
+      - --providers.docker.exposedbydefault=false
+      - --entrypoints.web.address=:80
+
+    ports:
+      - "80:80"
+
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+
+    networks:
+      - openvarde
+
 volumes:
   openvarde-data:
     name: openvarde-data
+
+networks:
+  openvarde:
+    external: true
