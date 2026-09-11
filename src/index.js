@@ -3,15 +3,28 @@ import fs from "node:fs";
 import path from "node:path";
 import http from "node:http";
 import mqtt from "mqtt";
+import { Bonjour } from "bonjour-service";
 
-const VERSION = "0.1.0";
+const VERSION = "0.2.0";
 
 const DATA_DIR = process.env.OPENVARDE_DATA_DIR || "/var/lib/openvarde";
 
 const NODE_FILE = path.join(DATA_DIR, "node.json");
 
+const PORT = Number(process.env.PORT || 8081);
+
+const MQTT_URL = process.env.MQTT_URL || "mqtt://localhost:1883";
+
+/*
+ * Node identity
+ */
+
 function generateNodeId() {
   return `ov-${crypto.randomBytes(16).toString("hex")}`;
+}
+
+function getShortNodeId(nodeId) {
+  return nodeId.replace(/^ov-/, "").slice(0, 8);
 }
 
 function loadOrCreateNode() {
@@ -55,18 +68,33 @@ function loadOrCreateNode() {
 
 const node = loadOrCreateNode();
 
-const MQTT_URL = process.env.MQTT_URL || "mqtt://localhost:1883";
+const shortId = getShortNodeId(node.node_id);
+
+const nodeName = node.name || `OpenVarde ${shortId}`;
+
+const mdnsHostname = `openvarde-${shortId}.local`;
+
+/*
+ * MQTT
+ */
 
 const STATUS_TOPIC = `openvarde/nodes/${node.node_id}/status`;
 
 const offlineStatus = JSON.stringify({
   status: "offline",
   node_id: node.node_id,
+  short_id: shortId,
+  name: nodeName,
+  hostname: mdnsHostname,
+  service: "openvarde-core",
+  version: VERSION,
 });
 
 const mqttClient = mqtt.connect(MQTT_URL, {
   clientId: `openvarde-core-${node.node_id}`,
   clean: true,
+
+  reconnectPeriod: 5000,
 
   will: {
     topic: STATUS_TOPIC,
@@ -82,8 +110,12 @@ mqttClient.on("connect", () => {
   const onlineStatus = JSON.stringify({
     status: "online",
     node_id: node.node_id,
+    short_id: shortId,
+    name: nodeName,
+    hostname: mdnsHostname,
     service: "openvarde-core",
     version: VERSION,
+    started_at: new Date().toISOString(),
   });
 
   mqttClient.publish(
@@ -96,6 +128,7 @@ mqttClient.on("connect", () => {
     (error) => {
       if (error) {
         console.error("Failed to publish node status:", error);
+
         return;
       }
 
@@ -104,43 +137,199 @@ mqttClient.on("connect", () => {
   );
 });
 
+mqttClient.on("reconnect", () => {
+  console.log(`Reconnecting to MQTT broker: ${MQTT_URL}`);
+});
+
+mqttClient.on("offline", () => {
+  console.warn("MQTT client is offline");
+});
+
 mqttClient.on("error", (error) => {
   console.error("MQTT error:", error);
 });
 
+/*
+ * HTTP API
+ */
+
+function sendJson(res, statusCode, payload) {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+
+  res.end(JSON.stringify(payload, null, 2));
+}
+
 const server = http.createServer((req, res) => {
-  if (req.url === "/health") {
-    res.writeHead(200, {
-      "Content-Type": "application/json",
+  const url = new URL(req.url, `http://${req.headers.host || "localhost"}`);
+
+  if (req.method === "GET" && url.pathname === "/health") {
+    sendJson(res, 200, {
+      status: "ok",
+      service: "openvarde-core",
+      version: VERSION,
+      node_id: node.node_id,
+      short_id: shortId,
+      name: nodeName,
+      hostname: mdnsHostname,
+      mqtt_connected: mqttClient.connected,
     });
 
-    res.end(
-      JSON.stringify({
-        status: "ok",
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/.well-known/openvarde") {
+    sendJson(res, 200, {
+      openvarde: "0.1",
+
+      node: {
+        id: node.node_id,
+        short_id: shortId,
+        name: nodeName,
+        hostname: mdnsHostname,
+        created_at: node.created_at || null,
+      },
+
+      core: {
         service: "openvarde-core",
         version: VERSION,
-        node_id: node.node_id,
-      }),
+      },
+
+      endpoints: {
+        health: "/health",
+        discovery: "/.well-known/openvarde",
+      },
+    });
+
+    return;
+  }
+
+  sendJson(res, 404, {
+    error: "not_found",
+  });
+});
+
+/*
+ * mDNS / DNS-SD discovery
+ */
+
+const bonjour = new Bonjour({}, (error) => {
+  console.error("mDNS error:", error);
+});
+
+let discoveryService = null;
+
+function startDiscovery() {
+  discoveryService = bonjour.publish({
+    name: nodeName,
+
+    type: "openvarde",
+
+    protocol: "tcp",
+
+    host: mdnsHostname,
+
+    port: PORT,
+
+    txt: {
+      version: VERSION,
+      node_id: node.node_id,
+      short_id: shortId,
+      well_known: "/.well-known/openvarde",
+    },
+  });
+
+  discoveryService.on("up", () => {
+    console.log(`OpenVarde discovery published`);
+
+    console.log(`Service: ${nodeName}._openvarde._tcp.local`);
+
+    console.log(`mDNS hostname: ${mdnsHostname}`);
+  });
+
+  discoveryService.on("error", (error) => {
+    console.error("Failed to publish OpenVarde discovery:", error);
+  });
+}
+
+/*
+ * Graceful shutdown
+ */
+
+let shuttingDown = false;
+
+async function shutdown(signal) {
+  if (shuttingDown) {
+    return;
+  }
+
+  shuttingDown = true;
+
+  console.log(`Received ${signal}, shutting down...`);
+
+  if (discoveryService) {
+    try {
+      discoveryService.stop();
+    } catch (error) {
+      console.error("Failed to stop mDNS service:", error);
+    }
+  }
+
+  try {
+    bonjour.destroy();
+  } catch (error) {
+    console.error("Failed to destroy Bonjour:", error);
+  }
+
+  server.close(() => {
+    console.log("HTTP server stopped");
+  });
+
+  if (mqttClient.connected) {
+    mqttClient.publish(
+      STATUS_TOPIC,
+      offlineStatus,
+      {
+        qos: 1,
+        retain: true,
+      },
+      () => {
+        mqttClient.end(false, {}, () => {
+          process.exit(0);
+        });
+      },
     );
 
     return;
   }
 
-  res.writeHead(404, {
-    "Content-Type": "application/json",
-  });
+  mqttClient.end(true);
 
-  res.end(
-    JSON.stringify({
-      error: "not_found",
-    }),
-  );
-});
+  process.exit(0);
+}
 
-const PORT = Number(process.env.PORT || 8081);
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+
+/*
+ * Startup
+ */
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`OpenVarde Core ${VERSION}`);
+
   console.log(`Node ID: ${node.node_id}`);
+
+  console.log(`Short ID: ${shortId}`);
+
+  console.log(`Node name: ${nodeName}`);
+
+  console.log(`mDNS hostname: ${mdnsHostname}`);
+
   console.log(`Listening on port ${PORT}`);
+
+  startDiscovery();
 });
